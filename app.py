@@ -22,15 +22,50 @@ MAX_PAGES = 5
 COMPANY_SUFFIXES = {"AB", "HB", "KB", "AKTIEBOLAG", "EK.FOR."}
 
 DATE_RE = r"\d{4}-\d{2}-\d{2}"
-# Swedish amounts: "14 875,00" / "1 625,00". The thousands space may be NBSP.
-AMOUNT_RE = r"\d[\d\s\u00a0\u2009\u202f]*,\d{2}"
+# Swedish amounts: "14 875,00" / "1 625,00" / "1625,00". The thousands
+# separator may be a (narrow) no-break space or a dot.
+AMOUNT_RE = r"\d{1,3}(?:[ \u00a0\u2009\u202f.]\d{3})+,\d{2}|\d+,\d{2}"
+
+# Label synonyms per field, most specific first. Matched case-insensitively.
+AMOUNT_LABELS = [
+    r"Totalt\s+belopp", r"Summa\s+att\s+betala", r"Totalt\s+att\s+betala",
+    r"Belopp\s+att\s+betala", r"Att\s+betala", r"Totalbelopp", r"Totalt",
+]
+INVOICE_NO_LABELS = [r"Faktura\s*-?\s*n(?:umme)?r\.?"]
+INVOICE_DATE_LABELS = [
+    r"Fakturadatum", r"Faktureringsdatum", r"Fakturadag", r"Datum",
+]
+DUE_DATE_LABELS = [
+    r"F\u00f6rfallodatum", r"F\u00f6rfallodag", r"F\u00f6rfaller",
+    r"Sista\s+betalningsdag(?:en)?", r"(?:Att\s+)?betalas?\s+senast",
+]
+OCR_LABELS = [
+    r"OCR\s*-?\s*(?:nummer|nr\.?|referens)", r"OCR",
+    r"Betalningsreferens", r"Referensnummer",
+]
+ORG_LABELS = [
+    r"Organisations?\s*-?\s*n(?:umme)?r\.?",
+    r"Org\.?\s*-?\s*n(?:umme)?r\.?",
+]
+VAT_LABELS = [
+    r"Momsreg(?:istrerings)?\.?\s*-?\s*n(?:umme)?r\.?",
+    r"VAT\s*-?\s*(?:nr|no|nummer|number)?\.?", r"Moms\s*nr\.?",
+]
+BANKGIRO_LABELS = [r"Bankgiro(?:nummer|nr)?", r"BG(?:\s*-?\s*nr)?"]
+PLUSGIRO_LABELS = [r"Plusgiro(?:nummer|nr)?", r"Postgiro", r"PG(?:\s*-?\s*nr)?"]
+# Labels under/after which the seller's name is printed.
+PAYEE_LABELS = [
+    r"Betalningsmottagare", r"Leverant\u00f6r", r"S\u00e4ljare",
+    r"F\u00f6retagsnamn", r"F\u00f6retag",
+]
+ADDRESS_LABELS = [r"Postadress", r"Adress"]
 
 
 def parse_amount(raw):
     """'14 875,00' -> 14875.0"""
     if not raw:
         return None
-    cleaned = re.sub(r"[\s\u00a0\u2009\u202f]", "", raw).replace(",", ".")
+    cleaned = re.sub(r"[\s\u00a0\u2009\u202f.]", "", raw).replace(",", ".")
     try:
         return float(cleaned)
     except ValueError:
@@ -52,33 +87,174 @@ def luhn_ok(number):
     return total % 10 == 0
 
 
+def _make_line(words, page_no):
+    words.sort(key=lambda w: w["x0"])
+    spans, text = [], ""
+    for word in words:
+        if text:
+            text += " "
+        spans.append((len(text), len(text) + len(word["text"])))
+        text += word["text"]
+    return {
+        "page": page_no,
+        "text": text,
+        "words": words,
+        "spans": spans,
+        "top": min(w["top"] for w in words),
+        "bottom": max(w["bottom"] for w in words),
+    }
+
+
 def extract_lines(pdf_path):
+    """Return text lines that also keep each word's position on the page."""
     lines = []
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages[:MAX_PAGES]:
-            text = page.extract_text(x_tolerance=1.5) or ""
-            lines.extend(line.strip() for line in text.split("\n") if line.strip())
+        for page_no, page in enumerate(pdf.pages[:MAX_PAGES]):
+            words = page.extract_words(x_tolerance=1.5, y_tolerance=3)
+            words.sort(key=lambda w: (w["top"], w["x0"]))
+            current, current_top = [], None
+            for word in words:
+                if current and abs(word["top"] - current_top) > 3:
+                    lines.append(_make_line(current, page_no))
+                    current = []
+                if not current:
+                    current_top = word["top"]
+                current.append(word)
+            if current:
+                lines.append(_make_line(current, page_no))
     return lines
 
 
-def first_match(lines, pattern, group=1):
-    for line in lines:
-        found = re.search(pattern, line)
-        if found:
-            return found.group(group)
+def _joined(a, b):
+    """True if word b follows word a with a normal space, not a column gap."""
+    height = max(a["bottom"] - a["top"], b["bottom"] - b["top"])
+    return b["x0"] - a["x1"] < 0.6 * height
+
+
+def _column_text(line, x0, x1):
+    """Text of the word run in `line` sitting under the horizontal span x0..x1.
+
+    Neighbouring words are joined while the gap between them looks like a
+    normal space; a wider gap is treated as a column boundary.
+    """
+    words = line["words"]
+    hits = [i for i, w in enumerate(words) if w["x0"] < x1 and w["x1"] > x0]
+    if not hits:
+        return None
+
+    first, last = hits[0], hits[-1]
+    while first > 0 and _joined(words[first - 1], words[first]):
+        first -= 1
+    while last < len(words) - 1 and _joined(words[last], words[last + 1]):
+        last += 1
+    return " ".join(w["text"] for w in words[first:last + 1])
+
+
+def find_value(lines, labels, value_re, free_text=False):
+    """Find the value printed after a label, or in the same column below it.
+
+    Returns the regex match object of `value_re` (anchored at the value start).
+    Labels are tried in priority order across the whole document. With
+    `free_text`, a same-line value must directly follow the label (no column
+    gap), so a header row of labels is not mistaken for a value.
+    """
+    for label in labels:
+        label_re = re.compile(rf"(?<!\w)(?:{label})(?!\w)", re.IGNORECASE)
+        for idx, line in enumerate(lines):
+            for found in label_re.finditer(line["text"]):
+                label_idx = [
+                    i for i, (s, e) in enumerate(line["spans"])
+                    if s < found.end() and e > found.start()
+                ]
+                label_words = [line["words"][i] for i in label_idx]
+                rest = line["text"][found.end():]
+                if free_text:
+                    words = line["words"]
+                    end = label_idx[-1]
+                    while end + 1 < len(words) and _joined(words[end], words[end + 1]):
+                        end += 1
+                    rest = line["text"][found.end():line["spans"][end][1]]
+                rest = re.sub(r"^\s*:?\s*", "", rest)
+                same_line = re.match(value_re, rest, re.IGNORECASE)
+                if same_line:
+                    return same_line
+
+                x0 = min(w["x0"] for w in label_words)
+                x1 = max(w["x1"] for w in label_words)
+                for below in lines[idx + 1: idx + 4]:
+                    if (below["page"] != line["page"]
+                            or below["top"] - line["bottom"] > 40):
+                        break
+                    text = _column_text(below, x0, x1)
+                    if text is None:
+                        continue
+                    value = re.match(value_re, text, re.IGNORECASE)
+                    if value:
+                        return value
+                    break
+    return None
+
+
+def find_group(lines, labels, value_re):
+    found = find_value(lines, labels, value_re)
+    return found.group(1) if found else None
+
+
+def _cut_at_company_suffix(text):
+    """'Acme Sverige AB 08-123 45' -> 'Acme Sverige AB'; None if no suffix."""
+    tokens = text.split()
+    for i, token in enumerate(tokens):
+        if token.strip(".,").upper() in COMPANY_SUFFIXES:
+            return " ".join(tokens[:i] + [token.rstrip(",")])
     return None
 
 
 def payee_name(lines):
-    """Pull the company name off the footer line that carries the org. number."""
-    for line in lines:
-        if "Organisationnummer" in line:
-            head = line.split("Organisationnummer")[0].strip()
-            tokens = head.split()
-            for i, token in enumerate(tokens):
-                if token.strip(".,").upper() in COMPANY_SUFFIXES:
-                    return " ".join(tokens[: i + 1])
-            return head
+    """Find the seller's company name."""
+    # 1. Footer line "Acme AB Organisationsnummer: 556..." - name precedes it.
+    for label in ORG_LABELS:
+        label_re = re.compile(
+            rf"(?<!\w)(?:{label})(?!\w)\s*:?\s*\d{{6}}-?\d{{4}}", re.IGNORECASE
+        )
+        for line in lines:
+            found = label_re.search(line["text"])
+            if found:
+                head = line["text"][:found.start()].strip(" :,")
+                if re.search(r"[A-Za-z\u00c0-\u00ff]{2}", head):
+                    return _cut_at_company_suffix(head) or head
+
+    # 2. An explicit payee label ("Betalningsmottagare: Acme AB").
+    found = find_value(lines, PAYEE_LABELS, r"(\S.*)", free_text=True)
+    if found:
+        text = found.group(1).strip()
+        return _cut_at_company_suffix(text) or text
+
+    # 3. A footer "Adress" column whose first line is the company name.
+    found = find_value(lines, ADDRESS_LABELS, r"(\S.*)", free_text=True)
+    if found:
+        name = _cut_at_company_suffix(found.group(1))
+        if name and not name.lower().startswith("c/o"):
+            return name
+
+    # 4. Last resort: the lowest line carrying a company-form suffix
+    # (sellers usually sit in the footer, customers in the header).
+    for line in reversed(lines):
+        if line["text"].lower().startswith("c/o"):
+            continue
+        name = _cut_at_company_suffix(line["text"])
+        if name:
+            return name
+    return None
+
+
+def org_number(lines):
+    org = find_group(lines, ORG_LABELS, r"(\d{6}-?\d{4})")
+    if org:
+        return org
+    # Swedish VAT numbers are SE + org. number + 01.
+    vat = find_value(lines, VAT_LABELS, r"SE\s?(\d{6})-?(\d{4})\s?01")
+    if vat:
+        return f"{vat.group(1)}-{vat.group(2)}"
     return None
 
 
@@ -103,35 +279,41 @@ def parse_invoice_pdf(pdf_path):
             "This app needs a text-based invoice."
         )
 
-    # "Totalt belopp SEK 1 625,00" is the authoritative total; fall back to the
-    # summary box "Totalt belopp 1 625,00" at the top of the invoice.
-    amount_raw = first_match(lines, rf"Totalt\s+belopp\s+SEK\s+({AMOUNT_RE})")
-    if amount_raw is None:
-        amount_raw = first_match(lines, rf"Totalt\s+belopp\s+({AMOUNT_RE})")
+    amount_raw = find_group(
+        lines, AMOUNT_LABELS, rf"(?:SEK|kr)?\s*({AMOUNT_RE})(?!\d)"
+    )
 
-    # Invoice number and date sit in the "Fakturanummer / Datum / ..." table row.
+    # Invoice number and date may sit in a "Fakturanummer / Datum / ..." table
+    # row; otherwise look them up by label.
     invoice_no = None
     invoice_date = None
     for idx, line in enumerate(lines):
-        if re.search(r"Fakturanummer\s+Datum", line) and idx + 1 < len(lines):
-            row = re.match(rf"^(\S+)\s+({DATE_RE})", lines[idx + 1])
+        if (re.search(r"Fakturanummer\s+Datum", line["text"])
+                and idx + 1 < len(lines)):
+            row = re.match(rf"^(\S+)\s+({DATE_RE})", lines[idx + 1]["text"])
             if row:
                 invoice_no, invoice_date = row.group(1), row.group(2)
             break
+    if invoice_no is None:
+        invoice_no = find_group(
+            lines, INVOICE_NO_LABELS, r"(?=[A-Za-z-]*\d)([A-Za-z0-9-]+)"
+        )
+    if invoice_date is None:
+        invoice_date = find_group(lines, INVOICE_DATE_LABELS, rf"({DATE_RE})")
 
-    giro = first_match(lines, r"Bankgiro\s+(\d{3,4}-\d{4})")
+    giro = find_group(lines, BANKGIRO_LABELS, r"(\d{3,4}-\d{4})(?!\d)")
     giro_type = "BG"
     if giro is None:
-        plusgiro = first_match(lines, r"Plusgiro\s+([\d\s-]{5,})")
+        plusgiro = find_group(lines, PLUSGIRO_LABELS, r"(\d[\d ]{0,9}-\d)(?!\d)")
         if plusgiro:
-            giro, giro_type = plusgiro.strip(), "PG"
+            giro, giro_type = plusgiro.replace(" ", ""), "PG"
 
     fields = {
         "payee_name": payee_name(lines),
-        "org_number": first_match(lines, r"Organisationnummer:?\s*(\d{6}-?\d{4})"),
-        "ocr_number": first_match(lines, r"OCR-nummer\s+(\d{6,25})"),
+        "org_number": org_number(lines),
+        "ocr_number": find_group(lines, OCR_LABELS, r"(\d{2,25})(?!\d)"),
         "invoice_date": invoice_date,
-        "due_date": first_match(lines, rf"F\u00f6rfallodatum\s+({DATE_RE})"),
+        "due_date": find_group(lines, DUE_DATE_LABELS, rf"({DATE_RE})"),
         "amount": parse_amount(amount_raw),
         "giro": giro,
         "giro_type": giro_type,
