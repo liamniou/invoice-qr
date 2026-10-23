@@ -23,12 +23,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - id: version
+        # Dependabot-bumpable tag (YYYY.M.D.run) for gitops pins.
+        run: echo "tag=$(date -u +%Y.%-m.%-d).${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+
       - id: push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: ghcr.io/liamniou/invoice-qr:latest
+          tags: |
+            ghcr.io/liamniou/invoice-qr:latest
+            ghcr.io/liamniou/invoice-qr:${{ steps.version.outputs.tag }}
 
       - name: Output image digest
         run: echo "IMAGE_DIGEST=${{ steps.push.outputs.digest }}"
